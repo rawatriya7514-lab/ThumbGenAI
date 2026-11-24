@@ -17,7 +17,6 @@ import android.graphics.Shader
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
 import com.google.mlkit.vision.common.InputImage
@@ -31,16 +30,30 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-import java.io.File
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
-enum class AspectRatio(val width: Int, val height: Int, val label: String) {
-    RATIO_16_9(1280, 720, "16:9 (YouTube Video)"),
-    RATIO_9_16(720, 1280, "9:16 (Shorts / Reel)"),
-    RATIO_1_1(1024, 1024, "1:1 (Post / Square)")
+enum class AspectRatio(val width: Int, val height: Int, val label: String, val subtitle: String) {
+    RATIO_16_9(1280, 720, "16:9 Landscape", "YouTube Video"),
+    RATIO_9_16(720, 1280, "9:16 Vertical", "Shorts / Reels / TikTok"),
+    RATIO_1_1(1024, 1024, "1:1 Square", "Instagram / Community"),
+    RATIO_4_5(864, 1080, "4:5 Portrait", "Instagram Feed"),
+    RATIO_3_4(768, 1024, "3:4 Portrait", "Tablet / Wallpaper"),
+    RATIO_4_3(1024, 768, "4:3 Classic", "Standard Display"),
+    RATIO_2_3(680, 1024, "2:3 Poster", "Pinterest Pin"),
+    RATIO_21_9(1280, 548, "21:9 Ultra-Wide", "Cinematic Banner")
+}
+
+enum class ImageStyle(val displayName: String, val promptSuffix: String) {
+    NONE("Raw Prompt", ""),
+    PHOTOREALISTIC("Photorealistic 8K", ", 8k photorealistic photography, hyper-detailed, Hasselblad 50mm f/1.8, cinematic studio lighting, ultra-sharp focus, rich textures"),
+    CINEMATIC("Cinematic Film", ", dramatic movie still, 35mm film grain, anamorphic lens flare, moody color grading, volumetric light rays, 8k"),
+    ANIME("Anime & Manga", ", vibrant Makoto Shinkai anime aesthetic, ultra-detailed line art, dynamic glowing eyes, beautiful dramatic clouds, masterwork"),
+    CYBERPUNK("Cyberpunk Neon", ", futuristic cyberpunk aesthetics, neon glowing reflections, rain slick streets, cyan and magenta rim lighting, highly detailed"),
+    THREE_D("3D Disney / Pixar", ", charming 3D digital animation character, cute expressive lighting, subsurface scattering, octane render, vibrant colors"),
+    DARK_FANTASY("Dark Fantasy", ", dark fantasy epic concept art, ominous fog, glowing magical runes, dark moody rim lighting, intricate details, trending on ArtStation"),
+    WATERCOLOR("Watercolor Art", ", delicate watercolor painting, soft pigment bleeding, expressive brush strokes, artistic splatter, paper texture")
 }
 
 enum class Niche(val displayName: String, val promptModifier: String, val hookKeywords: List<String>) {
@@ -80,8 +93,74 @@ class ThumbnailEngine(private val context: Context) {
         .build()
 
     /**
-     * Step 1: Generate AI Prompt & Text Hook Strategy
-     * Calls OpenRouter or Groq, or provides a rich heuristic strategy if no key or offline.
+     * AI Prompt Enhancer: Expands simple user ideas into master visual prompts.
+     */
+    suspend fun enhancePrompt(
+        rawPrompt: String,
+        style: ImageStyle,
+        apiKeys: ApiKeysConfig
+    ): String = withContext(Dispatchers.IO) {
+        val trimmed = rawPrompt.trim()
+        if (trimmed.isEmpty()) return@withContext ""
+
+        val llmKey = apiKeys.llmKey.trim()
+        if (llmKey.isNotEmpty()) {
+            try {
+                val isGroq = llmKey.startsWith("gsk_")
+                val url = if (isGroq) "https://api.groq.com/openai/v1/chat/completions" else "https://openrouter.ai/api/v1/chat/completions"
+                val model = if (isGroq) "llama-3.3-70b-versatile" else "meta-llama/llama-3.3-70b-instruct:free"
+
+                val systemPrompt = "You are an expert AI Visual Prompt Engineer. Turn the user's idea into an ultra-detailed, vivid 8K image prompt. Describe camera angle, lighting (e.g. rim light, volumetric glow), textures, and atmosphere. STRICT RULE: DO NOT put any text, typography, letters, or words in the prompt. Return ONLY the enhanced prompt string without commentary."
+
+                val jsonPayload = JSONObject().apply {
+                    put("model", model)
+                    put("temperature", 0.7)
+                    put("messages", org.json.JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("role", "system")
+                            put("content", systemPrompt)
+                        })
+                        put(JSONObject().apply {
+                            put("role", "user")
+                            put("content", "Idea: '$trimmed'. Desired Style: '${style.displayName}'.")
+                        })
+                    })
+                }
+
+                val reqBuilder = Request.Builder()
+                    .url(url)
+                    .addHeader("Authorization", "Bearer $llmKey")
+                    .addHeader("Content-Type", "application/json")
+                    .post(jsonPayload.toString().toRequestBody("application/json".toMediaType()))
+
+                if (!isGroq) {
+                    reqBuilder.addHeader("HTTP-Referer", "https://artraw.thumbgen")
+                    reqBuilder.addHeader("X-Title", "ThumbGen AI")
+                }
+
+                val response = httpClient.newCall(reqBuilder.build()).execute()
+                if (response.isSuccessful) {
+                    val body = response.body?.string().orEmpty()
+                    val respObj = JSONObject(body)
+                    val choices = respObj.optJSONArray("choices")
+                    if (choices != null && choices.length() > 0) {
+                        val enhanced = choices.getJSONObject(0).optJSONObject("message")?.optString("content").orEmpty().trim()
+                        if (enhanced.isNotEmpty()) {
+                            return@withContext enhanced
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Fallback to local heuristic enhancement
+            }
+        }
+
+        // Local Heuristic Enhancement
+        "$trimmed${style.promptSuffix}"
+    }
+
+    /**
+     * Step 1: Generate AI Prompt & Text Hook Strategy for YouTube Thumbnails
      */
     suspend fun generateStrategy(
         topic: String,
@@ -95,23 +174,15 @@ class ThumbnailEngine(private val context: Context) {
         if (llmKey.isNotEmpty()) {
             try {
                 val isGroq = llmKey.startsWith("gsk_")
-                val url = if (isGroq) {
-                    "https://api.groq.com/openai/v1/chat/completions"
-                } else {
-                    "https://openrouter.ai/api/v1/chat/completions"
-                }
-                val model = if (isGroq) {
-                    "llama-3.3-70b-versatile"
-                } else {
-                    "meta-llama/llama-3.3-70b-instruct:free"
-                }
+                val url = if (isGroq) "https://api.groq.com/openai/v1/chat/completions" else "https://openrouter.ai/api/v1/chat/completions"
+                val model = if (isGroq) "llama-3.3-70b-versatile" else "meta-llama/llama-3.3-70b-instruct:free"
 
                 val systemPrompt = """
                     You are an expert YouTube Thumbnail Strategist and AI Prompt Engineer.
                     Your goal is to produce:
-                    1. 'image_prompt': A photorealistic image description for a 16:9 or vertical background. Include camera angle, lighting (e.g. rim light, dark moody bokeh background), textures, and subject focus.
+                    1. 'image_prompt': A photorealistic image description for a ${aspectRatio.width}x${aspectRatio.height} background. Include camera angle, lighting (e.g. rim light, dark moody bokeh background), textures, and subject focus.
                     CRITICAL RULE: STRICTLY DO NOT include ANY text, words, labels, letters, or numbers in the image_prompt.
-                    2. 'text_hook': A punchy 2 to 4 word curiosity-driven text hook in Hinglish or English that creates extreme FOMO or curiosity.
+                    2. 'text_hook': A punchy 2 to 4 word curiosity-driven text hook in Hinglish or English that creates extreme curiosity.
                     Return ONLY a valid JSON object with keys 'image_prompt' and 'text_hook'.
                 """.trimIndent()
 
@@ -164,7 +235,7 @@ class ThumbnailEngine(private val context: Context) {
                     }
                 }
             } catch (e: Exception) {
-                // Fall through to heuristic fallback
+                // Fallback
             }
         }
 
@@ -175,94 +246,159 @@ class ThumbnailEngine(private val context: Context) {
     }
 
     /**
-     * Step 2: Multi-Provider Free Image Generation with Fallback
-     * Cloudflare Workers AI -> NVIDIA NIM -> Pollinations.ai -> Offline Procedural Bitmap
+     * Direct & Multi-Provider AI Image Generation:
+     * Supports:
+     * - "AUTO": Cloudflare -> NVIDIA NIM -> Pollinations
+     * - "NVIDIA": Direct NVIDIA NIM FLUX.1-dev
+     * - "CLOUDFLARE": Direct Cloudflare FLUX-1-schnell
+     * - "POLLINATIONS": Direct Pollinations FLUX (Free Open-Source)
      */
     suspend fun generateImage(
         prompt: String,
         aspectRatio: AspectRatio,
         apiKeys: ApiKeysConfig,
+        preferredProvider: String = "AUTO",
         onStatus: (String) -> Unit
     ): Bitmap = withContext(Dispatchers.IO) {
         val width = aspectRatio.width
         val height = aspectRatio.height
 
-        // 1. Try Cloudflare Workers AI (FLUX-1-schnell)
-        if (apiKeys.cfAccountId.isNotEmpty() && apiKeys.cfApiToken.isNotEmpty()) {
-            try {
-                onStatus("Rendering with Cloudflare FLUX-1...")
-                val cfUrl = "https://api.cloudflare.com/client/v4/accounts/${apiKeys.cfAccountId}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-                val payload = JSONObject().apply {
-                    put("prompt", prompt)
-                    put("num_steps", 6)
-                }
-                val request = Request.Builder()
-                    .url(cfUrl)
-                    .addHeader("Authorization", "Bearer ${apiKeys.cfApiToken}")
-                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
+        // Direct Cloudflare Selection
+        if (preferredProvider == "CLOUDFLARE" && apiKeys.cfAccountId.isNotEmpty() && apiKeys.cfApiToken.isNotEmpty()) {
+            val bmp = tryCloudflare(prompt, width, height, apiKeys, onStatus)
+            if (bmp != null) return@withContext bmp
+        }
 
-                val response = httpClient.newCall(request).execute()
-                if (response.isSuccessful) {
-                    val body = response.body?.string().orEmpty()
-                    val resObj = JSONObject(body).optJSONObject("result")
-                    val b64 = resObj?.optString("image").orEmpty()
+        // Direct NVIDIA NIM Selection
+        if (preferredProvider == "NVIDIA" && apiKeys.nvidiaKey.isNotEmpty()) {
+            val bmp = tryNvidia(prompt, width, height, apiKeys, onStatus)
+            if (bmp != null) return@withContext bmp
+        }
+
+        // Direct Pollinations Selection
+        if (preferredProvider == "POLLINATIONS") {
+            val bmp = tryPollinations(prompt, width, height, apiKeys, onStatus)
+            if (bmp != null) return@withContext bmp
+        }
+
+        // Auto Fallback Sequence: Cloudflare -> NVIDIA -> Pollinations
+        if (apiKeys.cfAccountId.isNotEmpty() && apiKeys.cfApiToken.isNotEmpty()) {
+            val bmp = tryCloudflare(prompt, width, height, apiKeys, onStatus)
+            if (bmp != null) return@withContext bmp
+        }
+
+        if (apiKeys.nvidiaKey.isNotEmpty()) {
+            val bmp = tryNvidia(prompt, width, height, apiKeys, onStatus)
+            if (bmp != null) return@withContext bmp
+        }
+
+        // Pollinations FLUX (Always open & free)
+        val polBmp = tryPollinations(prompt, width, height, apiKeys, onStatus)
+        if (polBmp != null) return@withContext polBmp
+
+        // Final Procedural Studio Background Fallback
+        onStatus("Creating studio visual canvas...")
+        createProceduralBackground(width, height)
+    }
+
+    private fun tryCloudflare(
+        prompt: String,
+        width: Int,
+        height: Int,
+        apiKeys: ApiKeysConfig,
+        onStatus: (String) -> Unit
+    ): Bitmap? {
+        return try {
+            onStatus("Rendering with Cloudflare Workers AI FLUX...")
+            val cfUrl = "https://api.cloudflare.com/client/v4/accounts/${apiKeys.cfAccountId}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+            val payload = JSONObject().apply {
+                put("prompt", prompt)
+                put("num_steps", 6)
+            }
+            val request = Request.Builder()
+                .url(cfUrl)
+                .addHeader("Authorization", "Bearer ${apiKeys.cfApiToken}")
+                .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+            if (response.isSuccessful) {
+                val body = response.body?.string().orEmpty()
+                val resObj = JSONObject(body).optJSONObject("result")
+                val b64 = resObj?.optString("image").orEmpty()
+                if (b64.isNotEmpty()) {
+                    val bytes = Base64.decode(b64, Base64.DEFAULT)
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null) {
+                        return Bitmap.createScaledBitmap(bmp, width, height, true)
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun tryNvidia(
+        prompt: String,
+        width: Int,
+        height: Int,
+        apiKeys: ApiKeysConfig,
+        onStatus: (String) -> Unit
+    ): Bitmap? {
+        return try {
+            onStatus("Rendering with NVIDIA NIM FLUX.1-dev...")
+            val nvWidth = ((width / 16) * 16).coerceIn(256, 1440)
+            val nvHeight = ((height / 16) * 16).coerceIn(256, 1440)
+
+            val nvUrl = "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev"
+            val payload = JSONObject().apply {
+                put("prompt", prompt)
+                put("width", nvWidth)
+                put("height", nvHeight)
+                put("steps", 25)
+                put("seed", 0)
+            }
+            val request = Request.Builder()
+                .url(nvUrl)
+                .addHeader("Authorization", "Bearer ${apiKeys.nvidiaKey}")
+                .addHeader("Accept", "application/json")
+                .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+            if (response.isSuccessful) {
+                val body = response.body?.string().orEmpty()
+                val resObj = JSONObject(body)
+                val artifacts = resObj.optJSONArray("artifacts")
+                if (artifacts != null && artifacts.length() > 0) {
+                    val b64 = artifacts.getJSONObject(0).optString("base64")
                     if (b64.isNotEmpty()) {
                         val bytes = Base64.decode(b64, Base64.DEFAULT)
                         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         if (bmp != null) {
-                            return@withContext Bitmap.createScaledBitmap(bmp, width, height, true)
+                            return Bitmap.createScaledBitmap(bmp, width, height, true)
                         }
                     }
                 }
-            } catch (e: Exception) {
-                // Try next provider
             }
+            null
+        } catch (e: Exception) {
+            null
         }
+    }
 
-        // 2. Try NVIDIA NIM (FLUX.1-dev)
-        if (apiKeys.nvidiaKey.isNotEmpty()) {
-            try {
-                onStatus("Rendering with NVIDIA NIM FLUX.1-dev...")
-                val nvUrl = "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev"
-                val payload = JSONObject().apply {
-                    put("prompt", prompt)
-                    put("width", width)
-                    put("height", height)
-                    put("steps", 25)
-                    put("seed", 0)
-                }
-                val request = Request.Builder()
-                    .url(nvUrl)
-                    .addHeader("Authorization", "Bearer ${apiKeys.nvidiaKey}")
-                    .addHeader("Accept", "application/json")
-                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
-
-                val response = httpClient.newCall(request).execute()
-                if (response.isSuccessful) {
-                    val body = response.body?.string().orEmpty()
-                    val resObj = JSONObject(body)
-                    val artifacts = resObj.optJSONArray("artifacts")
-                    if (artifacts != null && artifacts.length() > 0) {
-                        val b64 = artifacts.getJSONObject(0).optString("base64")
-                        if (b64.isNotEmpty()) {
-                            val bytes = Base64.decode(b64, Base64.DEFAULT)
-                            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                            if (bmp != null) {
-                                return@withContext Bitmap.createScaledBitmap(bmp, width, height, true)
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                // Try next provider
-            }
-        }
-
-        // 3. Try Pollinations.ai FLUX (Free Open Access)
+    private fun tryPollinations(
+        prompt: String,
+        width: Int,
+        height: Int,
+        apiKeys: ApiKeysConfig,
+        onStatus: (String) -> Unit
+    ): Bitmap? {
+        // Try Endpoint 1: gen.pollinations.ai
         try {
-            onStatus("Rendering with Pollinations FLUX...")
+            onStatus("Rendering with Pollinations FLUX (Instant Free)...")
             val encodedPrompt = URLEncoder.encode(prompt, "UTF-8")
             val polUrl = "https://gen.pollinations.ai/image/$encodedPrompt?model=flux&width=$width&height=$height&nologo=true"
             val reqBuilder = Request.Builder().url(polUrl)
@@ -275,17 +411,77 @@ class ThumbnailEngine(private val context: Context) {
                 if (bytes != null && bytes.isNotEmpty()) {
                     val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     if (bmp != null) {
-                        return@withContext Bitmap.createScaledBitmap(bmp, width, height, true)
+                        return Bitmap.createScaledBitmap(bmp, width, height, true)
                     }
                 }
             }
         } catch (e: Exception) {
-            // Fall through to procedural engine
+            // Try fallback endpoint
         }
 
-        // 4. Procedural Studio Background Fallback
-        onStatus("Generating studio visual base...")
-        return@withContext createProceduralBackground(width, height)
+        // Try Endpoint 2: image.pollinations.ai (Universal open fallback)
+        try {
+            val encodedPrompt = URLEncoder.encode(prompt, "UTF-8")
+            val polFallback = "https://image.pollinations.ai/prompt/$encodedPrompt?width=$width&height=$height&model=flux&nologo=true"
+            val response = httpClient.newCall(Request.Builder().url(polFallback).build()).execute()
+            if (response.isSuccessful) {
+                val bytes = response.body?.bytes()
+                if (bytes != null && bytes.isNotEmpty()) {
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null) {
+                        return Bitmap.createScaledBitmap(bmp, width, height, true)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Failed
+        }
+        return null
+    }
+
+    /**
+     * Test API connection for onboarding and settings
+     */
+    suspend fun testApiKey(provider: String, keyOrId: String, token: String = ""): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        try {
+            when (provider) {
+                "LLM" -> {
+                    if (keyOrId.isBlank()) return@withContext Pair(false, "API Key is empty")
+                    val isGroq = keyOrId.startsWith("gsk_")
+                    val url = if (isGroq) "https://api.groq.com/openai/v1/models" else "https://openrouter.ai/api/v1/models"
+                    val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $keyOrId").build()
+                    val res = httpClient.newCall(req).execute()
+                    if (res.isSuccessful) Pair(true, "Connected! (${if (isGroq) "Groq" else "OpenRouter"})") else Pair(false, "Invalid Key (HTTP ${res.code})")
+                }
+                "NVIDIA" -> {
+                    if (keyOrId.isBlank()) return@withContext Pair(false, "NVIDIA Key is empty")
+                    val req = Request.Builder()
+                        .url("https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev")
+                        .addHeader("Authorization", "Bearer $keyOrId")
+                        .addHeader("Accept", "application/json")
+                        .post("{}".toRequestBody("application/json".toMediaType()))
+                        .build()
+                    val res = httpClient.newCall(req).execute()
+                    // 422 or 200 means authenticated! 401/403 means auth failure.
+                    if (res.code != 401 && res.code != 403) Pair(true, "NVIDIA NIM Key Verified!") else Pair(false, "Authentication Failed (HTTP ${res.code})")
+                }
+                "CLOUDFLARE" -> {
+                    if (keyOrId.isBlank() || token.isBlank()) return@withContext Pair(false, "Account ID & Token required")
+                    val req = Request.Builder()
+                        .url("https://api.cloudflare.com/client/v4/accounts/$keyOrId/tokens/verify")
+                        .addHeader("Authorization", "Bearer $token")
+                        .build()
+                    val res = httpClient.newCall(req).execute()
+                    if (res.isSuccessful) Pair(true, "Cloudflare Workers AI Verified!") else Pair(false, "Verification Failed (HTTP ${res.code})")
+                }
+                "POLLINATIONS" -> {
+                    Pair(true, "Pollinations FLUX Ready (Free Instant Access)")
+                }
+                else -> Pair(false, "Unknown provider")
+            }
+        } catch (e: Exception) {
+            Pair(false, "Connection error: ${e.message}")
+        }
     }
 
     /**
@@ -307,7 +503,6 @@ class ThumbnailEngine(private val context: Context) {
 
     /**
      * Step 3: Composite base background + cutout subject (without text).
-     * This base composite can be cached so the user can edit text in real time!
      */
     suspend fun createBaseComposite(
         bgBitmap: Bitmap,
@@ -320,11 +515,9 @@ class ThumbnailEngine(private val context: Context) {
 
         val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(resultBitmap)
-
-        // Draw background
         canvas.drawBitmap(bgBitmap, 0f, 0f, null)
 
-        // Draw subtle dark vignette on left side to guarantee text readability
+        // Dark vignette on left to guarantee text readability
         val vignettePaint = Paint().apply {
             shader = LinearGradient(
                 0f, 0f,
@@ -336,7 +529,6 @@ class ThumbnailEngine(private val context: Context) {
         }
         canvas.drawRect(0f, 0f, width * 0.65f, height.toFloat(), vignettePaint)
 
-        // If reference image provided, process and place on the right
         if (referenceUri != null) {
             onStatus("Compositing reference cutout...")
             val refBitmap = loadBitmapFromUri(referenceUri, width, height)
@@ -347,25 +539,20 @@ class ThumbnailEngine(private val context: Context) {
                     refBitmap
                 }
 
-                // Scale subject cleanly to fit ~85% of thumbnail height
                 val targetSubjectHeight = (height * 0.88f).toInt()
                 val scale = targetSubjectHeight.toFloat() / subjectBitmap.height.toFloat()
                 val targetSubjectWidth = (subjectBitmap.width * scale).toInt()
 
                 val scaledSubject = Bitmap.createScaledBitmap(subjectBitmap, targetSubjectWidth, targetSubjectHeight, true)
-
-                // Position on right-third
                 val posX = (width - targetSubjectWidth - (width * 0.04f)).coerceAtLeast(width * 0.40f)
                 val posY = (height - targetSubjectHeight).toFloat()
 
-                // Draw rim glow behind subject
+                // Rim glow behind subject
                 val glowPaint = Paint().apply {
                     color = Color.argb(120, 255, 255, 255)
                     maskFilter = android.graphics.BlurMaskFilter(24f, android.graphics.BlurMaskFilter.Blur.OUTER)
                 }
                 canvas.drawBitmap(scaledSubject.extractAlpha(), posX, posY, glowPaint)
-
-                // Draw subject cutout
                 canvas.drawBitmap(scaledSubject, posX, posY, null)
             }
         }
@@ -375,7 +562,6 @@ class ThumbnailEngine(private val context: Context) {
 
     /**
      * Renders high-CTR Text Hook on top of the base composite.
-     * Features: Bold Sans-Serif, thick black stroke outline, drop shadow, yellow or white fill.
      */
     fun renderTextOnComposite(
         baseComposite: Bitmap,
@@ -422,7 +608,6 @@ class ThumbnailEngine(private val context: Context) {
             setShadowLayer(baseFontSize * 0.16f, 6f, 8f, Color.argb(220, 0, 0, 0))
         }
 
-        // Draw pill backdrop for maximum contrast
         val startX = width * 0.06f
         var currentY = height * 0.26f
         val lineSpacing = baseFontSize * 1.18f
@@ -441,10 +626,7 @@ class ThumbnailEngine(private val context: Context) {
                 color = Color.argb(160, 0, 0, 0)
             }
             canvas.drawRoundRect(pillRect, 16f, 16f, pillPaint)
-
-            // Draw outer black stroke
             canvas.drawText(line, startX, currentY, strokePaint)
-            // Draw inner vibrant fill
             canvas.drawText(line, startX, currentY, fillPaint)
 
             currentY += lineSpacing
@@ -454,11 +636,11 @@ class ThumbnailEngine(private val context: Context) {
     }
 
     /**
-     * Saves the final thumbnail directly to the Android Gallery under Pictures/ThumbGen
+     * Saves image directly to the Android Gallery under Pictures/ThumbGen
      */
-    suspend fun saveToGallery(bitmap: Bitmap, topic: String): Uri? = withContext(Dispatchers.IO) {
+    suspend fun saveToGallery(bitmap: Bitmap, prefix: String = "ThumbGen"): Uri? = withContext(Dispatchers.IO) {
         try {
-            val filename = "ThumbGen_${System.currentTimeMillis()}.png"
+            val filename = "${prefix}_${System.currentTimeMillis()}.png"
             val resolver = context.contentResolver
 
             val contentValues = ContentValues().apply {
@@ -533,13 +715,12 @@ class ThumbnailEngine(private val context: Context) {
         val paint = Paint().apply { shader = gradient }
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
 
-        // Decorative studio bokeh spots
         val bokehPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(35, 240, 68, 68)
+            color = Color.argb(45, 240, 68, 68)
         }
         canvas.drawCircle(width * 0.75f, height * 0.35f, width * 0.28f, bokehPaint)
 
-        bokehPaint.color = Color.argb(30, 0, 229, 255)
+        bokehPaint.color = Color.argb(40, 0, 229, 255)
         canvas.drawCircle(width * 0.88f, height * 0.75f, width * 0.22f, bokehPaint)
 
         return bitmap

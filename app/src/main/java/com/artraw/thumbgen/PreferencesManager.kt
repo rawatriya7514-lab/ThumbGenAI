@@ -3,6 +3,7 @@ package com.artraw.thumbgen
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -27,6 +28,8 @@ class PreferencesManager(private val context: Context) {
         val KEY_CF_TOKEN = stringPreferencesKey("cf_api_token")
         val KEY_NVIDIA = stringPreferencesKey("nvidia_api_key")
         val KEY_POLLINATIONS = stringPreferencesKey("pollinations_api_key")
+        val KEY_ONBOARDING_COMPLETED = booleanPreferencesKey("onboarding_completed")
+        val KEY_PREFERRED_PROVIDER = stringPreferencesKey("preferred_provider")
     }
 
     val apiKeysFlow: Flow<ApiKeysConfig> = context.dataStore.data.map { preferences ->
@@ -39,6 +42,14 @@ class PreferencesManager(private val context: Context) {
         )
     }
 
+    val onboardingCompletedFlow: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[KEY_ONBOARDING_COMPLETED] ?: false
+    }
+
+    val preferredProviderFlow: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[KEY_PREFERRED_PROVIDER] ?: "AUTO"
+    }
+
     suspend fun saveApiKeys(config: ApiKeysConfig) {
         context.dataStore.edit { preferences ->
             preferences[KEY_LLM] = config.llmKey.trim()
@@ -46,6 +57,18 @@ class PreferencesManager(private val context: Context) {
             preferences[KEY_CF_TOKEN] = config.cfApiToken.trim()
             preferences[KEY_NVIDIA] = config.nvidiaKey.trim()
             preferences[KEY_POLLINATIONS] = config.pollinationsKey.trim()
+        }
+    }
+
+    suspend fun setOnboardingCompleted(completed: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[KEY_ONBOARDING_COMPLETED] = completed
+        }
+    }
+
+    suspend fun setPreferredProvider(provider: String) {
+        context.dataStore.edit { preferences ->
+            preferences[KEY_PREFERRED_PROVIDER] = provider
         }
     }
 }
